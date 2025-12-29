@@ -1,87 +1,93 @@
-#include <SPI.h>
+#include <SPI.h>                      // Library for Serial Peripheral Interface (SPI)
 
 // --- Pin Definitions ---
-const int pinSTB = 10;
+const int pinSTB = 10;                // Sets the strobe pin required for SPI
 
 // --- VFD Constants ---
-const int MAX_COLS = 16;
-const int MAX_LINES = 2;
+const int MAX_COLS = 16;              // Sets the number of characters per row.
+const int MAX_LINES = 2;              // Sets the number of lines.
 
 // --- VFD Commands ---
-const byte CMD_CLEAR = 0x01;         // Clears the display
-const byte CMD_HOME = 0x02;          // Returns the cursor to home
-const byte CMD_ENTRY_MODE = 0x06;    // Increments cursor and doesn't shift.
-const byte CMD_CURSOR_LEFT = 0x10;   // Moves the cursor back one space.
-const byte CMD_FUNCTION_SET = 0x38;  // 8-bit, 2 Lines, 100% Brightness
-const byte CMD_DISPLAY_ON = 0x0C;    // Display on, Cursor off, Blink off.
+const byte CMD_CLEAR = 0x01;          // Clears the display
+const byte CMD_HOME = 0x02;           // Returns the cursor to home
+const byte CMD_ENTRY_MODE = 0x06;     // Increments cursor and doesn't shift.
+const byte CMD_CURSOR_LEFT = 0x10;    // Moves the cursor back one space.
+const byte CMD_FUNCTION_SET = 0x38;   // 8-bit, 2 Lines, 100% Brightness
+const byte CMD_DISPLAY_ON = 0x0C;     // Display on, Cursor off, Blink off.
 
 // --- BUFFER SETTINGS ---
-// It must be a power of 2 for the bitwise wrap-around to work efficiently (128, 256).
-const int BUF_SIZE = 1024;
-char rxBuffer[BUF_SIZE];
-int bufHead = 0;  // Where we write incoming data
-int bufTail = 0;  // Where we read data to display
 
-// --- FLOW CONTROL SETTINGS (NEW) ---
-const byte XON = 0x11;   // ASCII Character 17 (Resume)
-const byte XOFF = 0x13;  // ASCII Character 19 (Pause)
-bool senderPaused = false;
+// NOTE: Arduino IDE doesn't really do flow control, so expect long strings to get garbled if using the Serial Monitor.
+//       Other terminal emulators resepect the XON/XOFF control commands.
+//       You many need to set BUF_SIZE lower if you are out of memory.
 
-// When buffer fills to 512, tell PC to STOP.
-const int HIGH_WATER_MARK = 512;
-// When buffer drains to 256, tell PC to RESUME.
-const int LOW_WATER_MARK = 256;
+const int BUF_SIZE = 1024;            // Number of characters in buffer. Set to 128, 256, 512, or 1024.
+const int HIGH_WATER_MARK = 512;      // Stop when buffer reaches this many characters.
+const int LOW_WATER_MARK = 256;       // Resume loading when buffer reaches this many characters.
+
+char rxBuffer[BUF_SIZE];              // Character buffer array.
+int bufHead = 0;                      // Where we write incoming data
+int bufTail = 0;                      // Where we read data to display
+
+char screenBuffer[MAX_LINES][MAX_COLS]; // Character array for the 
+int currentLine = 0;                  // Used to track which line the cursor is on.
+int currentCol = 0;                   // Used to track the position on the line the cursor is on.
+
+// --- FLOW CONTROL SETTINGS ---
+const byte XON = 0x11;                // ASCII Character 17 (Resume)
+const byte XOFF = 0x13;               // ASCII Character 19 (Pause)
+bool senderPaused = false;            // Bool to check paused sending status.
 
 // --- TYPING SPEED SETTINGS ---
-const int typingDelay = 10;         // 10ms delay between chars
-unsigned long lastCharMillis = 0;  // Timer tracker
+  // Delay in ms from each character written on the display.
+  // 10 is very fast, 20 is fast (default speed), 50 is pretty slow, 100 is very slow.
+  // Your terminal emulator may also have character and line speed options.
+const int typingDelay = 20;           // Time in ms to delay next character written on screen.
+unsigned long lastCharMillis = 0;     // Timer tracker for character draw
 
-// --- Global Variables ---
-char screenBuffer[MAX_LINES][MAX_COLS];
-int currentLine = 0;
-int currentCol = 0;
-
-// Blink Logic
-unsigned long previousMillis = 0;
-const long blinkInterval = 500;
-bool cursorVisible = true;
-const byte cursorChar = 0xFF;
+// --- CURSOR BLINK VARIABLES ---
+  // The default cursor on the VFD blinks too fast.
+  // We use custom cursor blinking code.
+unsigned long previousMillis = 0;     // Timer tracker for cursor draw
+const long blinkInterval = 500;       // Time in ms that the cursor blinks on and off.
+bool cursorVisible = true;            // Sets cursor visibility. We turn it off in some functions.
+const byte cursorChar = 0xFF;         // Sets cursor character. 0xFF is full block (default), 0x5F is underscore, 0x10 is bar, 0x11 is thicker bar.
 
 void setup() {
-  pinMode(pinSTB, OUTPUT);
-  digitalWrite(pinSTB, HIGH);
+  pinMode(pinSTB, OUTPUT);            // Sets strobe pin as output (default is pin 10)
+  digitalWrite(pinSTB, HIGH);         // Sets strobe pin to high
 
-  Serial.begin(9600);
+  Serial.begin(9600);                 // Sets the serial speed to 9600 baud.
 
-  SPI.begin();
-  SPI.setBitOrder(MSBFIRST);
-  SPI.setDataMode(SPI_MODE3);
-  SPI.setClockDivider(SPI_CLOCK_DIV32);
+  SPI.begin();                        // Initializes the SPI on the Arduino.
+  
+  // TODO: setBitOrder, setDataMode, and setClockDivider are deprecated and beginTransacation() should be used instead.
+  SPI.setBitOrder(MSBFIRST);          // Set most significant bit first.
+  SPI.setDataMode(SPI_MODE3);         // Sets data mode to 0x0C
+  SPI.setClockDivider(SPI_CLOCK_DIV32); // Sets clock divider to 0x06
 
-  delay(100);
+  delay(100);                       // Wait 100ms for device SPI to respond.
 
-  // Initialize VFD
-  sendVFD(CMD_FUNCTION_SET, false);
-  delayMicroseconds(150);
+  // --- INITIALIZE THE VFD ---
+  sendVFD(CMD_FUNCTION_SET, false); // Sets VFD brightness, byte size, and number of lines
+  delayMicroseconds(150);           // Wait 150 microseconds for VFD to receive command.
   sendVFD(CMD_DISPLAY_ON, false);
-  delayMicroseconds(150);
+  delayMicroseconds(150);           // Wait 150 microseconds for VFD to receive command.
   sendVFD(CMD_ENTRY_MODE, false);
-  delayMicroseconds(150);
+  delayMicroseconds(150);           // Wait 150 microseconds for VFD to receive command.
 
-  // --- RUN STARTUP ANIMATION ---
-  startupSequence();
+  // --- VFD DISPLAY STARTUP SEQUENCE ---
+  startupSequence();                // Show the startup animation.
+  clearScreenBuffer();              // Clear the screen after the startup animation completes.
+  printVFD("Ready:");               // Print "Ready:" on the VFD display.
 
-  // Initialize Buffer & Screen
-  clearScreenBuffer();
-
-  // Print Test Message
-  printVFD("Ready:");
-
-  Serial.println("Ready for input.");
-  Serial.println(" Commands:");
-  Serial.println(" \\clear : Clear Screen");
-  Serial.println(" \\new   : New Line");
-  Serial.println(" \\F0    : Hex Code");
+  // --- DISPLAY COMMANDS IN TERMINAL EMULATOR ---
+    // TODO: Consider shorter commands or contol keys
+  Serial.println("Ready for input.");                             // Show that we are ready to accept input
+  Serial.println(" Commands:");                                   // List the command hints
+  Serial.println(" \\clear : Clear Screen");                      // Maybe \c instead?
+  Serial.println(" \\new   : New Line");                          // Maybe \n instead?
+  Serial.println(" \\HEX   : Table Characters e.g. \\5C for ¥."); // Maybe \h followed by hex code instead?
 }
 
 void loop() {
@@ -97,24 +103,19 @@ void loop() {
       rxBuffer[bufHead] = c;
       bufHead = nextHead;
     }
-    // (If buffer is full, we drop the char)
 
     // CHECK BUFFER LEVEL FOR PAUSE (XOFF)
     int bufferCount = (bufHead >= bufTail) ? (bufHead - bufTail) : (BUF_SIZE - bufTail + bufHead);
-
     if (bufferCount > HIGH_WATER_MARK && !senderPaused) {
       Serial.write(XOFF);
       senderPaused = true;
     }
-  }  // <--- ERROR WAS HERE: You were missing this closing brace!
+  } // This brace correctly closes the 'while' loop
 
   // --- 2. PROCESS VFD (CONSUMER) ---
-  // This must be OUTSIDE the while loop so it runs even when no data is arriving.
   if (bufHead != bufTail) {
-
     if (currentMillis - lastCharMillis >= typingDelay) {
       lastCharMillis = currentMillis;
-
       previousMillis = currentMillis;
       cursorVisible = true;
 
@@ -125,15 +126,15 @@ void loop() {
 
       // CHECK BUFFER LEVEL FOR RESUME (XON)
       int bufferCount = (bufHead >= bufTail) ? (bufHead - bufTail) : (BUF_SIZE - bufTail + bufHead);
-
       if (bufferCount < LOW_WATER_MARK && senderPaused) {
         Serial.write(XON);
         senderPaused = false;
       }
     }
-  }
+  } // This brace closes the 'if (bufHead != bufTail)' block
 
   // --- 3. BLINK LOGIC ---
+  // This must be INSIDE the loop() function to work
   if (bufHead == bufTail) {
     blinkLogic();
   }
