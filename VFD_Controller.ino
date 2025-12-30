@@ -52,6 +52,10 @@ unsigned long previousMillis = 0;     // Timer tracker for cursor draw
 const long blinkInterval = 500;       // Time in ms that the cursor blinks on and off.
 bool cursorVisible = true;            // Sets cursor visibility. We turn it off in some functions.
 const byte cursorChar = 0xFF;         // Sets cursor character. 0xFF is full block (default), 0x5F is underscore, 0x10 is bar, 0x11 is thicker bar.
+  // TODO: I have VFD modules that are set for English/Katakana, but the English/European-set modules have a different character map. 
+  // The underscore (0x5F) is the same, but 0xFF, 0x10, and 0x11 are all different.
+  // We *could* creator our own cursor character in the 0x0X space, but that would require more code.
+  // Can we probe the VFD for which mode it's in?
 
 void setup() {
   pinMode(pinSTB, OUTPUT);            // Sets strobe pin as output (default is pin 10)
@@ -61,7 +65,7 @@ void setup() {
 
   SPI.begin();                        // Initializes the SPI on the Arduino.
   
-  // TODO: setBitOrder, setDataMode, and setClockDivider are deprecated and beginTransacation() should be used instead.
+    // TODO: setBitOrder, setDataMode, and setClockDivider are deprecated and beginTransacation() should be used instead.
   SPI.setBitOrder(MSBFIRST);          // Set most significant bit first.
   SPI.setDataMode(SPI_MODE3);         // Sets data mode to 0x0C
   SPI.setClockDivider(SPI_CLOCK_DIV32); // Sets clock divider to 0x06
@@ -71,9 +75,9 @@ void setup() {
   // --- INITIALIZE THE VFD ---
   sendVFD(CMD_FUNCTION_SET, false); // Sets VFD brightness, byte size, and number of lines
   delayMicroseconds(150);           // Wait 150 microseconds for VFD to receive command.
-  sendVFD(CMD_DISPLAY_ON, false);
+  sendVFD(CMD_DISPLAY_ON, false);   // Sets display and hardware cursor mode (on, no cursor or blink).
   delayMicroseconds(150);           // Wait 150 microseconds for VFD to receive command.
-  sendVFD(CMD_ENTRY_MODE, false);
+  sendVFD(CMD_ENTRY_MODE, false);   // Sets character input mode (increment, no shift)
   delayMicroseconds(150);           // Wait 150 microseconds for VFD to receive command.
 
   // --- VFD DISPLAY STARTUP SEQUENCE ---
@@ -91,190 +95,203 @@ void setup() {
 }
 
 void loop() {
-  unsigned long currentMillis = millis();
+  unsigned long currentMillis = millis(); // We need to track time for cursor and character draw speed.
 
-  // --- 1. HIGH PRIORITY: FILL BUFFER (PRODUCER) ---
-  while (Serial.available() > 0) {
-    char c = Serial.read();
-    int nextHead = (bufHead + 1) % BUF_SIZE;
+  // --- 1. FILL CHARACTER BUFFER ---
+  while (Serial.available() > 0) {  // Do while bytes are waiting for serial buffer
+    char c = Serial.read();         // Take a single character 
+    int nextHead = (bufHead + 1) % BUF_SIZE;  // Find the position to put the character in the buffer
 
-    // Only save if we have room
-    if (nextHead != bufTail) {
-      rxBuffer[bufHead] = c;
-      bufHead = nextHead;
+    if (nextHead != bufTail) {      // Check that the nextHead isn't going to overflow
+      rxBuffer[bufHead] = c;        // Store the character in the rxBuffer array
+      bufHead = nextHead;           // Advance the bufHead pointer to the next position
     }
 
-    // CHECK BUFFER LEVEL FOR PAUSE (XOFF)
+    // Check for XOFF pause
+      // Figure out how many characters are in the buffer.
+      // Set bufferCount. If bufHead is >= bufTail, set bufferCount to bufHead - bufTail. If it has wrapped around, set to (BUF_SIZE - bufTail + bufHead).
+      // TODO: We reuse this below. This should be a function.
     int bufferCount = (bufHead >= bufTail) ? (bufHead - bufTail) : (BUF_SIZE - bufTail + bufHead);
-    if (bufferCount > HIGH_WATER_MARK && !senderPaused) {
-      Serial.write(XOFF);
-      senderPaused = true;
+    if (bufferCount > HIGH_WATER_MARK && !senderPaused) {         // If bufferCount exceeds our high-watermark and senderPaused is not true...
+      Serial.write(XOFF);                                         // Pause serial flow by setting to XOFF
+      senderPaused = true;                                        // Set our senderPaused tracking bool to true.
     }
-  } // This brace correctly closes the 'while' loop
+  }
 
-  // --- 2. PROCESS VFD (CONSUMER) ---
-  if (bufHead != bufTail) {
-    if (currentMillis - lastCharMillis >= typingDelay) {
-      lastCharMillis = currentMillis;
-      previousMillis = currentMillis;
-      cursorVisible = true;
+  // --- 2. SEND BUFFERED CHARACTERS  ---
+  if (bufHead != bufTail) {                                       // Make sure the buffer isn't empty by seeing if bufHead and bufTail don't match
+    if (currentMillis - lastCharMillis >= typingDelay) {          // Make sure we've waited time equal to the typingDelay time.
+      lastCharMillis = currentMillis;                             // Reset typing delay timer.
+      previousMillis = currentMillis;                             // Reset the blinking cursor timer.
+      cursorVisible = true;                                       // Show the cursor.
 
-      char c = rxBuffer[bufTail];
-      bufTail = (bufTail + 1) % BUF_SIZE;
+      char c = rxBuffer[bufTail];                                 // Get the next character from the buffer.
+      bufTail = (bufTail + 1) % BUF_SIZE;                         // Move the tail pointer to the next spot and ensure rollover.
 
-      processBufferedChar(c);
+      processBufferedChar(c);                                     // Process the character.
 
-      // CHECK BUFFER LEVEL FOR RESUME (XON)
+      // Check for XON resume
+        // TODO: Change bufferCount check to a function
       int bufferCount = (bufHead >= bufTail) ? (bufHead - bufTail) : (BUF_SIZE - bufTail + bufHead);
-      if (bufferCount < LOW_WATER_MARK && senderPaused) {
-        Serial.write(XON);
-        senderPaused = false;
+      if (bufferCount < LOW_WATER_MARK && senderPaused) {         // If we drop below our low-watermark and senderPaused is true...
+        Serial.write(XON);                                        // Resume serial flow by setting to XON
+        senderPaused = false;                                     // Set our senderPased tracking bool to true.
       }
     }
-  } // This brace closes the 'if (bufHead != bufTail)' block
+  }
 
-  // --- 3. BLINK LOGIC ---
-  // This must be INSIDE the loop() function to work
-  if (bufHead == bufTail) {
-    blinkLogic();
+  // --- LOGIC: CURSOR BLINKING ---
+  if (bufHead == bufTail) {         // If the buffer is empty...
+    blinkLogic();                   // Start the cursor blinking again.
   }
 }
+// --- HELPER: Advances the index of the array ---
+inline int nextIndex(int index) {   // Take the index for the array and move to the next item. 
+  return (index + 1) % BUF_SIZE;    // Return index + 1, but account for buffer rollover.
+  }  
 
 // --- LOGIC: Process 1 character from Buffer ---
 void processBufferedChar(char c) {
-  // --- CASE 1: SLASH COMMANDS (\new, \clear, \hex) ---
-  if (c == '\\') {
-    parseSlashCommand();
-    printStatus();
+  // --- Case 1: Check for possible slash commands ---
+  if (c == '\\') {                  // If the character is a backslash...
+    parseSlashCommand();            // Run it as a slash command
   }
-  // --- CASE 2: Jump to Line 2 (Pipe) ---
-  else if (c == '|') {
-    sendVFD(' ', true);
-    sendVFD(CMD_CURSOR_LEFT, false);
-    currentLine = 1;
-    currentCol = 0;
-    sendVFD(0x80 | 0x40, false);
-    printStatus();
+  // --- CASE 2: Line Feed or Carriage Return ---
+    // TODO: Not sure if we want to send CR and LF as commands...
+    // Windows uses CRLF, but UNIX and Linux use LF, so Windows would likely do two lines for each Enter vs. macOS doing a single line for Return.
+  else if (c == '\n' || c == '\r') {  // Check for \n and \r for new line and carriage return
+    handleNewline();                // Run the new line function.
   }
-  // --- CASE 3: Newline ---
-  else if (c == '\n' || c == '\r') {
-    handleNewline();
-    printStatus();
-  }
-  // --- CASE 4: Normal Typing ---
-  else {
-    writeChar(c);
-    printStatus();
+  // --- CASE 3: Normal Typing ---
+  else {                            // All other characters...
+    writeChar(c);                   // Run writeChar function.
   }
 }
 
-// --- COMMAND PARSER (Modified for Ring Buffer) ---
+// --- SLASH COMMAND PARSER ---
 void parseSlashCommand() {
-  String cmd = "";
-  unsigned long startWait = millis();
+  String cmd = "";                    // Initialize cmd as a blank string.
+  unsigned long startWait = millis(); // Start a timer since the function started.
   
   // 1. READ COMMAND
-  while (cmd.length() < 5) {
-    if (millis() - startWait > 3000) break; // Timeout
+  while (cmd.length() < 5) {          // If the slash command is valid, it should be less than 5 chars.
+                                      // TODO: Change commands to single characters.
+    if (millis() - startWait > 3000) break; // Timeout if longer than 3 seconds.
 
     // Read from Buffer
-    if (bufHead != bufTail) {
-      char nextC = rxBuffer[bufTail];
+    if (bufHead != bufTail) {         // If the buffer isn't empty...
+      char nextC = rxBuffer[bufTail]; // Check the *next* character in the buffer.
       
       // Stop at delimiter
-      if (nextC == ' ' || nextC == '\n' || nextC == '\r') {
-        bufTail = (bufTail + 1) % BUF_SIZE; // Consume delimiter
-        break; 
+      if (nextC == ' ' || nextC == '\n' || nextC == '\r') { // If we see a space, carriage return, or line feed...
+        nextIndex(bufTail);           // Remove it from the buffer.
+        break;                        // Break out of the function.
       }
       
-      cmd += nextC;
-      bufTail = (bufTail + 1) % BUF_SIZE; // Consume char
+      cmd += nextC;                   // Add the next character to the cmd string.
+      nextIndex(bufTail);             // Remove the character from the buffer.
     }
 
     // Keep filling Buffer from Hardware
-    while (Serial.available() > 0) {
-       char c = Serial.read();
-       int nextHead = (bufHead + 1) % BUF_SIZE;
-       if (nextHead != bufTail) {
-         rxBuffer[bufHead] = c;
-         bufHead = nextHead;
-       }
+      // TODO: This should be a function.
+    while (Serial.available() > 0) {      // Do while bytes are waiting for serial buffer
+      char c = Serial.read();             // Take a single character 
+      int nextHead = nextIndex(bufHead);  // Find the position to put the character in the buffer
+
+      if (nextHead != bufTail) {      // Check that the nextHead isn't going to overflow
+        rxBuffer[bufHead] = c;        // Store the character in the rxBuffer array
+        bufHead = nextHead;           // Advance the bufHead pointer to the next position
+      }
+
+      // Check for XOFF pause
+        // Figure out how many characters are in the buffer.
+        // Set bufferCount. If bufHead is >= bufTail, set bufferCount to bufHead - bufTail. If it has wrapped around, set to (BUF_SIZE - bufTail + bufHead).
+      int bufferCount = (bufHead >= bufTail) ? (bufHead - bufTail) : (BUF_SIZE - bufTail + bufHead);
+      if (bufferCount > HIGH_WATER_MARK && !senderPaused) {         // If bufferCount exceeds our high-watermark and senderPaused is not true...
+        Serial.write(XOFF);                                         // Pause serial flow by setting to XOFF
+        senderPaused = true;                                        // Set our senderPaused tracking bool to true.
+      }
     }
   }
-
   // 2. CRITICAL: CATCH LAGGY NEWLINES
   // Wait 10ms to ensure the \n part of a \r\n pair has time to arrive
-  unsigned long cleanupStart = millis();
-  while(millis() - cleanupStart < 10) {
-      while (Serial.available() > 0) {
-       char c = Serial.read();
-       int nextHead = (bufHead + 1) % BUF_SIZE;
-       if (nextHead != bufTail) {
-         rxBuffer[bufHead] = c;
-         bufHead = nextHead;
+  unsigned long cleanupStart = millis();          // Start tracking time since we got to this step.
+  while(millis() - cleanupStart < 10) {           // If greater than 10ms...
+    // TODO: This should be a function.
+      while (Serial.available() > 0) {            // ...and while there are items in the buffer...
+       char c = Serial.read();                    // Get the character
+       int nextHead = nextIndex(bufHead);         // Figure out where it belongs in the buffer
+       if (nextHead != bufTail) {                 // Check that it won't overflow the buffer
+         rxBuffer[bufHead] = c;                   // Put the character in the rxBuffer array
+         bufHead = nextHead;                      // Advance the bufHead pointer to the next position.
        }
     }
   }
 
-  // 3. EAT TRAILING NEWLINES
-  // If the very next char is a newline, it belongs to this command -> Trash it.
-  if (bufHead != bufTail) {
-    char peek = rxBuffer[bufTail];
-    if (peek == '\n' || peek == '\r') {
-      bufTail = (bufTail + 1) % BUF_SIZE; 
+  // 3. REMOVE TRAILING CR and LF
+  if (bufHead != bufTail) {                   // If the buffer isn't empty...
+    char peek = rxBuffer[bufTail];            // Check the tail of the rxBuffer array
+    if (peek == '\n' || peek == '\r') {       // If it is a CR or LF...
+      nextIndex(bufTail);                     // Remove the character from the buffer.
     }
   }
   
-  // 4. EXECUTE
-  if (cmd.equalsIgnoreCase("clear")) {
-    clearScreenBuffer();
+  // 4. EXECUTE COMMANDS
+  if (cmd.equalsIgnoreCase("clear")) {        // If the command is \clear...
+    clearScreenBuffer();                      // Clear the screen.
   }
-  else if (cmd.equalsIgnoreCase("new")) {
-    handleNewline();
+  else if (cmd.equalsIgnoreCase("new")) {     // If the command is \new...
+    handleNewline();                          // Move to a new line.
   }
-  else if (cmd.length() == 2) {
-    char h = cmd.charAt(0);
-    char l = cmd.charAt(1);
-    byte rawByte = (hexToVal(h) << 4) + hexToVal(l);
-    writeChar(rawByte);
+    // TODO: Rewrite hex character code for explicit \hex command.
+  else if (cmd.length() == 2) {               // If the command is two characters, it's a hex code
+    char h = cmd.charAt(0);                   // Set higher nibble to h
+    char l = cmd.charAt(1);                   // Set lower nibble to l
+    byte rawByte = (hexToVal(h) << 4) + hexToVal(l); // Move the higher nibble left and fill the remaining space with lower nibble
+    writeChar(rawByte);                       // Write the rawByte value as the character to display.
   }
 }
 
-// --- BLINK LOGIC ---
+// --- CURSOR BLINK LOGIC ---
 void blinkLogic() {
-  unsigned long currentMillis = millis();
-  if (currentMillis - previousMillis >= blinkInterval) {
-    previousMillis = currentMillis;
-    cursorVisible = !cursorVisible;
+  unsigned long currentMillis = millis();     // Check how long since this function started
+  if (currentMillis - previousMillis >= blinkInterval) { // If it's been longer than the blinkInterval...
+    previousMillis = currentMillis;           // Reset the timer
+    cursorVisible = !cursorVisible;           // Toggle cursor visibility.
 
-    if (cursorVisible) {
-      sendVFD(cursorChar, true);
-    } else {
-      sendVFD(' ', true);
+    if (cursorVisible) {                      // While the cursor is visible...
+      sendVFD(cursorChar, true);              // Send the cursor character as a command
+    } else {                                  // Otherwise...
+      sendVFD(' ', true);                     // Send a blank space as a command... We could change this to be a different symbol, if we liked...
     }
-    sendVFD(CMD_CURSOR_LEFT, false);
+    sendVFD(CMD_CURSOR_LEFT, false);          // This keeps the cursor in the same space instead of moving to the next space after each write.
   }
 }
 
-// --- STANDARD HELPERS (Unchanged) ---
+// --- STARTUP SEQUENCE ---
 void startupSequence() {
-  byte animChars[] = { 0x20, 0x10, 0x11, 0x12, 0x13, 0x14 };
-  sendVFD(CMD_CLEAR, false);
-  delay(1);
-  for (int row = 0; row < MAX_LINES; row++) {
-    byte lineStart = (row == 0) ? 0x80 : (0x80 | 0x40);
-    sendVFD(lineStart, false);
-    for (int col = 0; col < MAX_COLS; col++) {
-      for (int i = 0; i < 5; i++) {
-        sendVFD(animChars[i], true);
-        sendVFD(CMD_CURSOR_LEFT, false);
-        delay(1);
+  byte animChars[] = { 0x20, 0x10, 0x11, 0x12, 0x13, 0x14 };  // Set the following characters from the map: blank space, 1/5, 2/5, 3/5, 4/5, and 5/5 blocks.
+    // TODO: Like the cursor, these are different on the English/European character map.
+    // There is no equivalent for the blocks, so maybe we use the 0x0X custom character space?
+    // Could see if we can probe for character type.
+  sendVFD(CMD_CLEAR, false);                                  // Clear the display.
+  delay(1);                                                   // Wait 1ms for display matrix to clear.
+  for (int row = 0; row < MAX_LINES; row++) {                 // Do this for each line available to us...
+    byte lineStart = (row == 0) ? 0x80 : (0x80 | 0x40);       // If row is 0, set to the first space in first row (0x80), if not set to first space in first row, then jump to second row.
+    sendVFD(lineStart, false);                                // Send whichever of the commands we set
+    for (int col = 0; col < MAX_COLS; col++) {                // For each one of these columns...
+      for (int i = 0; i < 5; i++) {                           // Increment through the 6 characters that we set in animChars[].
+    // TODO: Should this actually be i < 4 since we draw the full block on a separate line?
+        sendVFD(animChars[i], true);                          // Send index of animChars.
+        sendVFD(CMD_CURSOR_LEFT, false);                      // Set the cursor back to the same spot.
+        delay(1);                                             // Wait 1ms for VFD to do this action.
       }
-      sendVFD(animChars[5], true);
-      delay(5);
+      sendVFD(animChars[5], true);                            // Keep the last character on that spot and advance to next spot.
+      delay(5);                                               // Wait 5ms for VFD to advance.
+    // TODO: Maybe remove this delay to see how it looks...
     }
   }
-  delay(500);
+  delay(500);                                                 // Keep the full bars on screen for 0.5 seconds.
 }
 
 void handleNewline() {
@@ -362,4 +379,5 @@ void printVFD(const char* str) {
   while (*str) {
     writeChar(*str++);
   }
+
 }
