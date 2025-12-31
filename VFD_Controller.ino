@@ -150,6 +150,12 @@ inline int nextIndex(int index) {   // Take the index for the array and move to 
   return (index + 1) % BUF_SIZE;    // Return index + 1, but account for buffer rollover.
   }  
 
+// Function: Move to next line and first column
+void moveToNextLine () {
+  sendVFD(0x80 | 0x40, false); // Send commands 0x80 and 0x40
+}
+  
+
 // --- LOGIC: Process 1 character from Buffer ---
 void processBufferedChar(char c) {
   // --- Case 1: Check for possible slash commands ---
@@ -184,12 +190,12 @@ void parseSlashCommand() {
       
       // Stop at delimiter
       if (nextC == ' ' || nextC == '\n' || nextC == '\r') { // If we see a space, carriage return, or line feed...
-        nextIndex(bufTail);           // Remove it from the buffer.
+        bufTail = nextIndex(bufTail);           // Remove it from the buffer.
         break;                        // Break out of the function.
       }
       
       cmd += nextC;                   // Add the next character to the cmd string.
-      nextIndex(bufTail);             // Remove the character from the buffer.
+      bufTail = nextIndex(bufTail);             // Remove the character from the buffer.
     }
 
     // Keep filling Buffer from Hardware
@@ -232,7 +238,7 @@ void parseSlashCommand() {
   if (bufHead != bufTail) {                   // If the buffer isn't empty...
     char peek = rxBuffer[bufTail];            // Check the tail of the rxBuffer array
     if (peek == '\n' || peek == '\r') {       // If it is a CR or LF...
-      nextIndex(bufTail);                     // Remove the character from the buffer.
+      bufTail = nextIndex(bufTail);           // Remove the character from the buffer.
     }
   }
   
@@ -281,103 +287,101 @@ void startupSequence() {
     sendVFD(lineStart, false);                                // Send whichever of the commands we set
     for (int col = 0; col < MAX_COLS; col++) {                // For each one of these columns...
       for (int i = 0; i < 5; i++) {                           // Increment through the 6 characters that we set in animChars[].
-    // TODO: Should this actually be i < 4 since we draw the full block on a separate line?
         sendVFD(animChars[i], true);                          // Send index of animChars.
         sendVFD(CMD_CURSOR_LEFT, false);                      // Set the cursor back to the same spot.
         delay(1);                                             // Wait 1ms for VFD to do this action.
       }
       sendVFD(animChars[5], true);                            // Keep the last character on that spot and advance to next spot.
       delay(5);                                               // Wait 5ms for VFD to advance.
-    // TODO: Maybe remove this delay to see how it looks...
     }
   }
-  delay(500);                                                 // Keep the full bars on screen for 0.5 seconds.
+  delay(1000);                                                 // Keep the full bars on screen for 1 second.
 }
 
+// Function: Move to a new line
 void handleNewline() {
-  sendVFD(' ', true);
-  sendVFD(CMD_CURSOR_LEFT, false);
-  if (currentLine == 0) {
-    currentLine = 1;
-    currentCol = 0;
-    sendVFD(0x80 | 0x40, false);
+  sendVFD(' ', true);               // Send a space to the display
+  sendVFD(CMD_CURSOR_LEFT, false);  // Tell the cursor to go back one space
+  if (currentLine == 0) {           // If we are on line 0...
+    currentLine = 1;                // Set line to 1
+    currentCol = 0;                 // Set column to 0
+    moveToNextLine();               // Move the cursor to next line
   } else {
     scrollDisplayUp();
   }
 }
 
+// Function: Write Character to a Screen
 void writeChar(char c) {
-  if (currentCol >= MAX_COLS) {
-    if (currentLine == 0) {
-      currentLine = 1;
-      currentCol = 0;
-      sendVFD(0x80 | 0x40, false);
-    } else {
-      scrollDisplayUp();
+  if (currentCol >= MAX_COLS) {     // If we are out of open columns...
+    if (currentLine == 0) {         // If the current line is 0...
+      currentLine = 1;              // Set the line to 1
+      currentCol = 0;               // Set the column to 0
+      moveToNextLine();             // Send command to move to next line
+    } else {                        // If the line is greater than 0...
+      scrollDisplayUp();            // Scroll the display up
     }
   }
-  if (currentCol == 0) {
-    byte addr = (currentLine == 0) ? 0x80 : (0x80 | 0x40);
-    sendVFD(addr, false);
+  if (currentCol == 0) {            // If the current column is 0...
+    byte addr = (currentLine == 0) ? 0x80 : (0x80 | 0x40);  // Set the byte address to match its current position.
+    sendVFD(addr, false);           // Send the address that we just set.
   }
-  screenBuffer[currentLine][currentCol] = c;
-  sendVFD(c, true);
-  currentCol++;
+  screenBuffer[currentLine][currentCol] = c;  // Set the character for the current screenBuffer array position
+  sendVFD(c, true);                           // Send the character.
+  currentCol++;                               // Advance the column count
 }
 
+// Function: Scroll the display up a line
 void scrollDisplayUp() {
-  for (int i = 0; i < MAX_COLS; i++) {
-    screenBuffer[0][i] = screenBuffer[1][i];
-    screenBuffer[1][i] = ' ';
+  for (int i = 0; i < MAX_COLS; i++) {        // For each of the available columns...
+    screenBuffer[0][i] = screenBuffer[1][i];  // Put the data from line 1, column i into the screenBuffer
+    screenBuffer[1][i] = ' ';                 // Set line 1 to blank.
   }
-  sendVFD(CMD_CLEAR, false);
-  delay(5);
-  for (int i = 0; i < MAX_COLS; i++) {
-    sendVFD(screenBuffer[0][i], true);
-    delayMicroseconds(50);
+  sendVFD(CMD_CLEAR, false);                  // Clear the screen
+  delay(5);                                   // Wait 5ms
+  for (int i = 0; i < MAX_COLS; i++) {        // For each of the available columns...
+    sendVFD(screenBuffer[0][i], true);        // Send the screenBuffer to line 0
+    delayMicroseconds(50);                    // Wait 50 microseconds for VFD to process
   }
-  sendVFD(0x80 | 0x40, false);
-  currentLine = 1;
-  currentCol = 0;
+  moveToNextLine();                           // After all that is complete, move the cursor to line 1
+  currentLine = 1;                            // Set the currentLine to 1
+  currentCol = 0;                             // set currentCol to 0
 }
 
+// Function: Clear the screen buffer
 void clearScreenBuffer() {
-  for (int y = 0; y < MAX_LINES; y++) {
-    for (int x = 0; x < MAX_COLS; x++) {
-      screenBuffer[y][x] = ' ';
+  for (int y = 0; y < MAX_LINES; y++) {       // For each of the lines...
+    for (int x = 0; x < MAX_COLS; x++) {      // For each of the columns...
+      screenBuffer[y][x] = ' ';               // Set each to a blank space
     }
   }
-  currentLine = 0;
-  currentCol = 0;
-  sendVFD(CMD_CLEAR, false);
-  delay(5);
+  currentLine = 0;                            // Set currentLine to 0
+  currentCol = 0;                             // Set currentCol to 0
+  sendVFD(CMD_CLEAR, false);                  // Tell the VFD to clear the screen.
+  delay(5);                                   // Wait 5ms before proceeding.
 }
 
+// Function: Convert hex values for characters to a byte value for the serial connection
 byte hexToVal(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  return 0;
+  if (c >= '0' && c <= '9') return c - '0';             // Handle 0-9 hex values
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;        // Handle A-F hex values, uppercase
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;        // Handle A-F hex values, lowercase
+  return 0;                                             // Return 0 if invalid hex character
 }
 
-void printStatus() {
-  // Commented out to reduce serial traffic during fast pasting
-  // Serial.print("Pos: L"); Serial.print(currentLine);
-  // Serial.print(" C"); Serial.println(currentCol);
+// Function: Send data to VFD module
+void sendVFD(byte data, bool isData) {        
+  byte startByte = isData ? 0xFA : 0xF8;      // isData: True to send character data, False to send control command
+  digitalWrite(pinSTB, LOW);                  // Set the strobe pin to tell the VFD to prepare for data
+  SPI.transfer(startByte);                    // Send the startByte
+  SPI.transfer(data);                         // Send the data
+  digitalWrite(pinSTB, HIGH);                 // Set the strobe to high to signal the transaction is complete
+  delayMicroseconds(60);                      // Wait 60 microseconds for VFD to respond to data
 }
 
-void sendVFD(byte data, bool isData) {
-  byte startByte = isData ? 0xFA : 0xF8;
-  digitalWrite(pinSTB, LOW);
-  SPI.transfer(startByte);
-  SPI.transfer(data);
-  digitalWrite(pinSTB, HIGH);
-  delayMicroseconds(60);
-}
-
-void printVFD(const char* str) {
-  while (*str) {
-    writeChar(*str++);
+// Function: Print character on VFD
+void printVFD(const char* str) {    // Take the string
+  while (*str) {                    // While the string has data
+    writeChar(*str++);              // Increment the string data position
   }
-
 }
