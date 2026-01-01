@@ -57,204 +57,33 @@ const byte cursorChar = 0xFF;         // Sets cursor character. 0xFF is full blo
   // We *could* creator our own cursor character in the 0x0X space, but that would require more code.
   // Can we probe the VFD for which mode it's in?
 
-void setup() {
-  pinMode(pinSTB, OUTPUT);            // Sets strobe pin as output (default is pin 10)
-  digitalWrite(pinSTB, HIGH);         // Sets strobe pin to high
+// --- HELPER: Advances the index of the array ---
+inline int nextIndex(int index) {   // Take the index for the array and move to the next item. 
+  return (index + 1) % BUF_SIZE;    // Return index + 1, but account for buffer rollover.
+  }
 
-  Serial.begin(9600);                 // Sets the serial speed to 9600 baud.
+// Function: Move to next line and first column
+void moveToNextLine () {
+  sendVFD(0x80 | 0x40, false); // Send commands 0x80 and 0x40
+} 
 
-  SPI.begin();                        // Initializes the SPI on the Arduino.
-  
-    // TODO: setBitOrder, setDataMode, and setClockDivider are deprecated and beginTransacation() should be used instead.
-  SPI.setBitOrder(MSBFIRST);          // Set most significant bit first.
-  SPI.setDataMode(SPI_MODE3);         // Sets data mode to 0x0C
-  SPI.setClockDivider(SPI_CLOCK_DIV32); // Sets clock divider to 0x06
-
-  delay(100);                       // Wait 100ms for device SPI to respond.
-
-  // --- INITIALIZE THE VFD ---
-  sendVFD(CMD_FUNCTION_SET, false); // Sets VFD brightness, byte size, and number of lines
-  delayMicroseconds(150);           // Wait 150 microseconds for VFD to receive command.
-  sendVFD(CMD_DISPLAY_ON, false);   // Sets display and hardware cursor mode (on, no cursor or blink).
-  delayMicroseconds(150);           // Wait 150 microseconds for VFD to receive command.
-  sendVFD(CMD_ENTRY_MODE, false);   // Sets character input mode (increment, no shift)
-  delayMicroseconds(150);           // Wait 150 microseconds for VFD to receive command.
-
-  // --- VFD DISPLAY STARTUP SEQUENCE ---
-  startupSequence();                // Show the startup animation.
-  clearScreenBuffer();              // Clear the screen after the startup animation completes.
-  printVFD("Ready:");               // Print "Ready:" on the VFD display.
-
-  // --- DISPLAY COMMANDS IN TERMINAL EMULATOR ---
-    // TODO: Consider shorter commands or contol keys
-  Serial.println("Ready for input.");                             // Show that we are ready to accept input
-  Serial.println(" Commands:");                                   // List the command hints
-  Serial.println(" \\clear : Clear Screen");                      // Maybe \c instead?
-  Serial.println(" \\new   : New Line");                          // Maybe \n instead?
-  Serial.println(" \\HEX   : Table Characters e.g. \\5C for ¥."); // Maybe \h followed by hex code instead?
-}
-
-void loop() {
-  unsigned long currentMillis = millis(); // We need to track time for cursor and character draw speed.
-
-  // --- 1. FILL CHARACTER BUFFER ---
-  while (Serial.available() > 0) {  // Do while bytes are waiting for serial buffer
-    char c = Serial.read();         // Take a single character 
-    int nextHead = (bufHead + 1) % BUF_SIZE;  // Find the position to put the character in the buffer
+void updateSerialBuffer(){
+  while (Serial.available() > 0) {      // Do while bytes are waiting for serial buffer
+    char c = Serial.read();             // Take a single character 
+    int nextHead = nextIndex(bufHead);  // Find the position to put the character in the buffer
 
     if (nextHead != bufTail) {      // Check that the nextHead isn't going to overflow
       rxBuffer[bufHead] = c;        // Store the character in the rxBuffer array
       bufHead = nextHead;           // Advance the bufHead pointer to the next position
     }
-
     // Check for XOFF pause
-      // Figure out how many characters are in the buffer.
-      // Set bufferCount. If bufHead is >= bufTail, set bufferCount to bufHead - bufTail. If it has wrapped around, set to (BUF_SIZE - bufTail + bufHead).
-      // TODO: We reuse this below. This should be a function.
+    // Figure out how many characters are in the buffer.
+    // Set bufferCount. If bufHead is >= bufTail, set bufferCount to bufHead - bufTail. If it has wrapped around, set to (BUF_SIZE - bufTail + bufHead).
     int bufferCount = (bufHead >= bufTail) ? (bufHead - bufTail) : (BUF_SIZE - bufTail + bufHead);
     if (bufferCount > HIGH_WATER_MARK && !senderPaused) {         // If bufferCount exceeds our high-watermark and senderPaused is not true...
       Serial.write(XOFF);                                         // Pause serial flow by setting to XOFF
       senderPaused = true;                                        // Set our senderPaused tracking bool to true.
     }
-  }
-
-  // --- 2. SEND BUFFERED CHARACTERS  ---
-  if (bufHead != bufTail) {                                       // Make sure the buffer isn't empty by seeing if bufHead and bufTail don't match
-    if (currentMillis - lastCharMillis >= typingDelay) {          // Make sure we've waited time equal to the typingDelay time.
-      lastCharMillis = currentMillis;                             // Reset typing delay timer.
-      previousMillis = currentMillis;                             // Reset the blinking cursor timer.
-      cursorVisible = true;                                       // Show the cursor.
-
-      char c = rxBuffer[bufTail];                                 // Get the next character from the buffer.
-      bufTail = (bufTail + 1) % BUF_SIZE;                         // Move the tail pointer to the next spot and ensure rollover.
-
-      processBufferedChar(c);                                     // Process the character.
-
-      // Check for XON resume
-        // TODO: Change bufferCount check to a function
-      int bufferCount = (bufHead >= bufTail) ? (bufHead - bufTail) : (BUF_SIZE - bufTail + bufHead);
-      if (bufferCount < LOW_WATER_MARK && senderPaused) {         // If we drop below our low-watermark and senderPaused is true...
-        Serial.write(XON);                                        // Resume serial flow by setting to XON
-        senderPaused = false;                                     // Set our senderPased tracking bool to true.
-      }
-    }
-  }
-
-  // --- LOGIC: CURSOR BLINKING ---
-  if (bufHead == bufTail) {         // If the buffer is empty...
-    blinkLogic();                   // Start the cursor blinking again.
-  }
-}
-// --- HELPER: Advances the index of the array ---
-inline int nextIndex(int index) {   // Take the index for the array and move to the next item. 
-  return (index + 1) % BUF_SIZE;    // Return index + 1, but account for buffer rollover.
-  }  
-
-// Function: Move to next line and first column
-void moveToNextLine () {
-  sendVFD(0x80 | 0x40, false); // Send commands 0x80 and 0x40
-}
-  
-
-// --- LOGIC: Process 1 character from Buffer ---
-void processBufferedChar(char c) {
-  // --- Case 1: Check for possible slash commands ---
-  if (c == '\\') {                  // If the character is a backslash...
-    parseSlashCommand();            // Run it as a slash command
-  }
-  // --- CASE 2: Line Feed or Carriage Return ---
-    // TODO: Not sure if we want to send CR and LF as commands...
-    // Windows uses CRLF, but UNIX and Linux use LF, so Windows would likely do two lines for each Enter vs. macOS doing a single line for Return.
-  else if (c == '\n' || c == '\r') {  // Check for \n and \r for new line and carriage return
-    handleNewline();                // Run the new line function.
-  }
-  // --- CASE 3: Normal Typing ---
-  else {                            // All other characters...
-    writeChar(c);                   // Run writeChar function.
-  }
-}
-
-// --- SLASH COMMAND PARSER ---
-void parseSlashCommand() {
-  String cmd = "";                    // Initialize cmd as a blank string.
-  unsigned long startWait = millis(); // Start a timer since the function started.
-  
-  // 1. READ COMMAND
-  while (cmd.length() < 5) {          // If the slash command is valid, it should be less than 5 chars.
-                                      // TODO: Change commands to single characters.
-    if (millis() - startWait > 3000) break; // Timeout if longer than 3 seconds.
-
-    // Read from Buffer
-    if (bufHead != bufTail) {         // If the buffer isn't empty...
-      char nextC = rxBuffer[bufTail]; // Check the *next* character in the buffer.
-      
-      // Stop at delimiter
-      if (nextC == ' ' || nextC == '\n' || nextC == '\r') { // If we see a space, carriage return, or line feed...
-        bufTail = nextIndex(bufTail);           // Remove it from the buffer.
-        break;                        // Break out of the function.
-      }
-      
-      cmd += nextC;                   // Add the next character to the cmd string.
-      bufTail = nextIndex(bufTail);             // Remove the character from the buffer.
-    }
-
-    // Keep filling Buffer from Hardware
-      // TODO: This should be a function.
-    while (Serial.available() > 0) {      // Do while bytes are waiting for serial buffer
-      char c = Serial.read();             // Take a single character 
-      int nextHead = nextIndex(bufHead);  // Find the position to put the character in the buffer
-
-      if (nextHead != bufTail) {      // Check that the nextHead isn't going to overflow
-        rxBuffer[bufHead] = c;        // Store the character in the rxBuffer array
-        bufHead = nextHead;           // Advance the bufHead pointer to the next position
-      }
-
-      // Check for XOFF pause
-        // Figure out how many characters are in the buffer.
-        // Set bufferCount. If bufHead is >= bufTail, set bufferCount to bufHead - bufTail. If it has wrapped around, set to (BUF_SIZE - bufTail + bufHead).
-      int bufferCount = (bufHead >= bufTail) ? (bufHead - bufTail) : (BUF_SIZE - bufTail + bufHead);
-      if (bufferCount > HIGH_WATER_MARK && !senderPaused) {         // If bufferCount exceeds our high-watermark and senderPaused is not true...
-        Serial.write(XOFF);                                         // Pause serial flow by setting to XOFF
-        senderPaused = true;                                        // Set our senderPaused tracking bool to true.
-      }
-    }
-  }
-  // 2. CRITICAL: CATCH LAGGY NEWLINES
-  // Wait 10ms to ensure the \n part of a \r\n pair has time to arrive
-  unsigned long cleanupStart = millis();          // Start tracking time since we got to this step.
-  while(millis() - cleanupStart < 10) {           // If greater than 10ms...
-    // TODO: This should be a function.
-      while (Serial.available() > 0) {            // ...and while there are items in the buffer...
-       char c = Serial.read();                    // Get the character
-       int nextHead = nextIndex(bufHead);         // Figure out where it belongs in the buffer
-       if (nextHead != bufTail) {                 // Check that it won't overflow the buffer
-         rxBuffer[bufHead] = c;                   // Put the character in the rxBuffer array
-         bufHead = nextHead;                      // Advance the bufHead pointer to the next position.
-       }
-    }
-  }
-
-  // 3. REMOVE TRAILING CR and LF
-  if (bufHead != bufTail) {                   // If the buffer isn't empty...
-    char peek = rxBuffer[bufTail];            // Check the tail of the rxBuffer array
-    if (peek == '\n' || peek == '\r') {       // If it is a CR or LF...
-      bufTail = nextIndex(bufTail);           // Remove the character from the buffer.
-    }
-  }
-  
-  // 4. EXECUTE COMMANDS
-  if (cmd.equalsIgnoreCase("clear")) {        // If the command is \clear...
-    clearScreenBuffer();                      // Clear the screen.
-  }
-  else if (cmd.equalsIgnoreCase("new")) {     // If the command is \new...
-    handleNewline();                          // Move to a new line.
-  }
-    // TODO: Rewrite hex character code for explicit \hex command.
-  else if (cmd.length() == 2) {               // If the command is two characters, it's a hex code
-    char h = cmd.charAt(0);                   // Set higher nibble to h
-    char l = cmd.charAt(1);                   // Set lower nibble to l
-    byte rawByte = (hexToVal(h) << 4) + hexToVal(l); // Move the higher nibble left and fill the remaining space with lower nibble
-    writeChar(rawByte);                       // Write the rawByte value as the character to display.
   }
 }
 
@@ -383,5 +212,207 @@ void sendVFD(byte data, bool isData) {
 void printVFD(const char* str) {    // Take the string
   while (*str) {                    // While the string has data
     writeChar(*str++);              // Increment the string data position
+  }
+}
+// --- FUNCTION: Check if character is a valid hex entry ---
+bool isHex(char c) {
+  return ((c >= '0' && c <= '9') || 
+          (c >= 'A' && c <= 'F') || 
+          (c >= 'a' && c <= 'f'));
+}
+
+// --- LOGIC: Process 1 character from Buffer ---
+void processBufferedChar(char c) {
+  // --- Case 1: Check for possible slash commands ---
+  if (c == '\\') {                  // If the character is a backslash...
+    parseSlashCommand();            // Run it as a slash command
+  }
+  // --- CASE 2: Line Feed or Carriage Return ---
+    // TODO: Not sure if we want to send CR and LF as commands...
+    // Windows uses CRLF, but UNIX and Linux use LF, so Windows would likely do two lines for each Enter vs. macOS doing a single line for Return.
+  else if (c == '\n' || c == '\r') {  // Check for \n and \r for new line and carriage return
+    handleNewline();                // Run the new line function.
+  }
+  // --- CASE 3: Normal Typing ---
+  else {                            // All other characters...
+    writeChar(c);                   // Run writeChar function.
+  }
+}
+
+// --- SLASH COMMAND PARSER ---
+void parseSlashCommand() {
+  String cmd = "";                    // Initialize cmd as a blank string.
+  unsigned long startWait = millis(); // Start a timer since the function started.
+  
+  // 1. READ COMMAND
+  while (true) {                      // We originally looked for command length, but we've removed it.
+    if (cmd.length() > 10) {          // If we accidentally parse something as a command, we want to stop 
+      Serial.println("This command is too long.");
+      cmd = "";
+      if (millis() - startWait > 3000) { // Timeout if longer than 3 seconds.
+        Serial.println("Command timeout.");
+        break; 
+      }
+      if (bufHead != bufTail) {          // If the buffer isn't empty...
+        char trash = rxBuffer[bufTail]; // Get the character at the end of rxBuffer[]
+        if (trash == ' ' || trash == '\n' || trash == '\r') { // Check for delimiters
+          bufTail = nextIndex(bufTail); // Consume the delimiter
+          break;
+        }
+        else if (trash == '\\') {        // We want to break if we see another backslash
+          break;
+        }
+          bufTail = nextIndex(bufTail); 
+        }
+      updateSerialBuffer();
+      }
+
+    // Read from Buffer
+    if (bufHead != bufTail) {         // If the buffer isn't empty...
+      char nextC = rxBuffer[bufTail]; // Check the *next* character in the buffer.
+      
+      // Stop at delimiter
+      if (nextC == ' ' || nextC == '\n' || nextC == '\r') { // If we see a space, carriage return, or line feed...
+        bufTail = nextIndex(bufTail);           // Remove it from the buffer.
+        break;                                  // Break out of the function.
+      }
+      
+      cmd += nextC;                   // Add the next character to the cmd string.
+      bufTail = nextIndex(bufTail);   // Remove the character from the buffer.
+    }
+    updateSerialBuffer();             // Keep filling the buffer.
+  }
+
+  // 2. CATCH LAGGY NEWLINES
+  // Wait 10ms to ensure the \n part of a \r\n pair has time to arrive
+  unsigned long cleanupStart = millis();          // Start tracking time since we got to this step.
+  while(millis() - cleanupStart < 10) {           // If greater than 10ms...
+    updateSerialBuffer();
+       }
+
+ 
+  // 3. REMOVE TRAILING CR and LF
+  if (bufHead != bufTail) {                   // If the buffer isn't empty...
+    char peek = rxBuffer[bufTail];            // Check the tail of the rxBuffer array
+    if (peek == '\n' || peek == '\r') {       // If it is a CR or LF...
+      bufTail = nextIndex(bufTail);           // Remove the character from the buffer.
+    }
+  }
+  
+  // 4. EXECUTE COMMANDS
+  if (cmd.equalsIgnoreCase("c")) {            // If the command is \c...
+    clearScreenBuffer();                      // Clear the screen.
+  }
+  else if (cmd.equalsIgnoreCase("n")) {       // If the command is \n...
+    handleNewline();                          // Move to a new line.
+  }
+  // If the command is \h and there are two more characters...
+  else if ((cmd.charAt(0) == 'h' || cmd.charAt(0) == 'H') && cmd.length() == 3) {
+      char h = cmd.charAt(1);                   // Set higher nibble to h
+      char l = cmd.charAt(2);                   // Set lower nibble to l
+      if (isHex(h) && isHex(l)) {
+        byte rawByte = (hexToVal(h) << 4) + hexToVal(l); // Move the higher nibble left and fill the remaining space with lower nibble
+        writeChar(rawByte);                     // Write the rawByte value as the character to display.
+      }
+      else{
+        Serial.println("Invalid hex code.");
+      }
+    }
+  else {
+    Serial.println("Invalid command.");
+  }
+}
+  
+int bufferCounter(int currentBufHead, int currentBufTail) {
+  int bufferCount = (currentBufHead - currentBufTail + BUF_SIZE) % BUF_SIZE;
+  return bufferCount;
+}
+
+void setup() {
+  pinMode(pinSTB, OUTPUT);            // Sets strobe pin as output (default is pin 10)
+  digitalWrite(pinSTB, HIGH);         // Sets strobe pin to high
+
+  Serial.begin(9600);                 // Sets the serial speed to 9600 baud.
+
+  SPI.begin();                        // Initializes the SPI on the Arduino.
+  
+    // TODO: setBitOrder, setDataMode, and setClockDivider are deprecated and beginTransacation() should be used instead.
+  SPI.setBitOrder(MSBFIRST);          // Set most significant bit first.
+  SPI.setDataMode(SPI_MODE3);         // Sets data mode to 0x0C
+  SPI.setClockDivider(SPI_CLOCK_DIV32); // Sets clock divider to 0x06
+
+  delay(100);                       // Wait 100ms for device SPI to respond.
+
+  // --- INITIALIZE THE VFD ---
+  sendVFD(CMD_FUNCTION_SET, false); // Sets VFD brightness, byte size, and number of lines
+  delayMicroseconds(150);           // Wait 150 microseconds for VFD to receive command.
+  sendVFD(CMD_DISPLAY_ON, false);   // Sets display and hardware cursor mode (on, no cursor or blink).
+  delayMicroseconds(150);           // Wait 150 microseconds for VFD to receive command.
+  sendVFD(CMD_ENTRY_MODE, false);   // Sets character input mode (increment, no shift)
+  delayMicroseconds(150);           // Wait 150 microseconds for VFD to receive command.
+
+  // --- VFD DISPLAY STARTUP SEQUENCE ---
+  startupSequence();                // Show the startup animation.
+  clearScreenBuffer();              // Clear the screen after the startup animation completes.
+  printVFD("Ready:");               // Print "Ready:" on the VFD display.
+
+  // --- DISPLAY COMMANDS IN TERMINAL EMULATOR ---
+    // TODO: Consider shorter commands or contol keys
+  Serial.println("Ready for input.");                             // Show that we are ready to accept input
+  Serial.println(" Commands:");                                   // List the command hints
+  Serial.println(" \\c : Clear Screen");
+  Serial.println(" \\n : New Line");
+  Serial.println(" \\h : Table Characters e.g. \\h5C for ¥.");
+}
+
+void loop() {
+  unsigned long currentMillis = millis(); // We need to track time for cursor and character draw speed.
+  updateSerialBuffer();
+  
+  // --- 1. FILL CHARACTER BUFFER ---
+  while (Serial.available() > 0) {  // Do while bytes are waiting for serial buffer
+    char c = Serial.read();         // Take a single character 
+    int nextHead = (bufHead + 1) % BUF_SIZE;  // Find the position to put the character in the buffer
+
+    if (nextHead != bufTail) {      // Check that the nextHead isn't going to overflow
+      rxBuffer[bufHead] = c;        // Store the character in the rxBuffer array
+      bufHead = nextHead;           // Advance the bufHead pointer to the next position
+    }
+
+    // Check for XOFF pause
+      // Figure out how many characters are in the buffer.
+      // Set bufferCount. If bufHead is >= bufTail, set bufferCount to bufHead - bufTail. If it has wrapped around, set to (BUF_SIZE - bufTail + bufHead).
+    int bufferCount = bufferCounter(bufHead, bufTail);
+    if (bufferCount > HIGH_WATER_MARK && !senderPaused) {         // If bufferCount exceeds our high-watermark and senderPaused is not true...
+      Serial.write(XOFF);                                         // Pause serial flow by setting to XOFF
+      senderPaused = true;                                        // Set our senderPaused tracking bool to true.
+    }
+  }
+
+  // --- 2. SEND BUFFERED CHARACTERS  ---
+  if (bufHead != bufTail) {                                       // Make sure the buffer isn't empty by seeing if bufHead and bufTail don't match
+    if (currentMillis - lastCharMillis >= typingDelay) {          // Make sure we've waited time equal to the typingDelay time.
+      lastCharMillis = currentMillis;                             // Reset typing delay timer.
+      previousMillis = currentMillis;                             // Reset the blinking cursor timer.
+      cursorVisible = true;                                       // Show the cursor.
+
+      char c = rxBuffer[bufTail];                                 // Get the next character from the buffer.
+      bufTail = (bufTail + 1) % BUF_SIZE;                         // Move the tail pointer to the next spot and ensure rollover.
+
+      processBufferedChar(c);                                     // Process the character.
+
+      // Check for XON resume
+        // TODO: Change bufferCount check to a function
+      int bufferCount = bufferCounter(bufHead, bufTail);
+      if (bufferCount < LOW_WATER_MARK && senderPaused) {         // If we drop below our low-watermark and senderPaused is true...
+        Serial.write(XON);                                        // Resume serial flow by setting to XON
+        senderPaused = false;                                     // Set our senderPased tracking bool to true.
+      }
+    }
+  }
+
+  // --- LOGIC: CURSOR BLINKING ---
+  if (bufHead == bufTail) {         // If the buffer is empty...
+    blinkLogic();                   // Start the cursor blinking again.
   }
 }
